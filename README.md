@@ -21,7 +21,7 @@ data-processing pipelines.  Pretrained models are also provided for estimating
 curvatures, Laplace-Beltrami operators, components for PDE solvers, and other
 geometric tasks.
 
-**Robust Processing:** Our pre-trained GNP models and training methods also allow for 
+**Robust Estimators:** Our pre-trained GNP models and training methods also allow for 
 coping with noise and other artifacts that arise when processing point-clouds in practice.
 This allows for robust estimates of the curvature and other geometric properties even when 
 point-clouds have artifacts, such as outliers as shown below. 
