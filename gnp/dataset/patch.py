@@ -8,6 +8,36 @@ from torch_geometric.nn import radius_graph
 
 from .pca import PCABatch
 
+def radius_graph(
+    x: torch.Tensor,
+    radius: float,
+    source_inds: Optional[torch.LongTensor] = None,
+    target_inds: Optional[torch.LongTensor] = None,
+    max_num_neighbors: int = 30,
+):
+    if target_inds is None:
+        target_inds = torch.arange(x.shape[0], device=x.device)
+
+    if source_inds is None:
+        source_inds = torch.arange(x.shape[0], device=x.device)
+
+    tree = KDTree(x[source_inds].cpu().numpy())
+    radius_inds = tree.query_ball_point(x[target_inds].cpu().numpy(), r=radius)
+
+    def choose(array):
+        return np.random.choice(
+            array, size=min(max_num_neighbors, len(array)), replace=False
+        )
+
+    cols = list(map(choose, radius_inds))
+    lengths = torch.LongTensor(list(map(len, cols)))
+
+    cols = torch.LongTensor(np.concatenate(cols))
+    rows = torch.repeat_interleave(target_inds, lengths)
+
+    edges = torch.stack((cols, rows)).to(x.device)
+    return edges
+
 def graph_from_dict(sample: dict, 
                     radius: float, 
                     max_num_neighbors: int=32):
@@ -34,14 +64,7 @@ def graph_from_dict(sample: dict,
     if edge_data is None:
         edge_data = x
 
-    tree = KDTree(x.cpu().detach().numpy())
-    cols = tree.query_ball_point(x.cpu().detach().numpy(), r=radius)
-    cols = [
-        np.random.choice(c, size=min(max_num_neighbors, len(c)), replace=False) for c in cols
-        ]
-    cols = [torch.tensor(c).long() for c in cols]
-    rows = [torch.full_like(c, i) for i, c in enumerate(cols)]
-    edge_ind = torch.stack((torch.cat(rows), torch.cat(cols)), dim=0)
+    edge_ind = radius_graph(x, radius=radius, max_num_neighbors=max_num_neighbors)
 
     edge_attr = edge_data[edge_ind.t()].reshape(-1, 2 * edge_data.shape[1])
 
@@ -165,7 +188,7 @@ class PatchGenerator:
         """        
         
         if self.center == 'tree':
-            _, ind = self.tree.query(self.x.cpu().numpy(), k=int(self.knn//3))
+            _, ind = self.tree.query(self.x.cpu().numpy(), k=int(0.66 * self.knn))
             centers = []
             mask = np.ones(self.x.shape[0], dtype=bool)
             arange = np.arange(self.x.shape[0])
