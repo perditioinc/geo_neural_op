@@ -107,6 +107,9 @@ B. Quackenbush and P. J. Atzberger, Machine Learning: Science and Technology, 5.
 __Acknowledgements__
 This work was supported by NSF Grant DMS-1616353 and NSF-DMS-2306345.
 
+__Additional Information__ <br>
+https://web.atzberger.org
+
 ----
 
 [Documentation](https://web.math.ucsb.edu/~atzberg/geo_neural_op_docs/html/index.html) |
