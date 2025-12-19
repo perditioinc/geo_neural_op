@@ -5,7 +5,7 @@
 [Documentation](https://web.math.ucsb.edu/~atzberg/geo_neural_op_docs/html/index.html) |
 [Examples](./examples) |
 [Paper 1](https://doi.org/10.1088/2632-2153/ad8980) |
-[Paper 2](https://arxiv.org/abs/2503.04649)
+[Paper 2](https://doi.org/10.1088/2632-2153/ae1bf8)
                                                                                                 
 ### Geometric Neural Operators (GNPs) 
 
@@ -120,7 +120,7 @@ https://web.atzberger.org
 [Documentation](https://web.math.ucsb.edu/~atzberg/geo_neural_op_docs/html/index.html) |
 [Examples](./examples) |
 [Paper 1](https://doi.org/10.1088/2632-2153/ad8980) |
-[Paper 2](https://arxiv.org/abs/2503.04649)
+[Paper 2](https://doi.org/10.1088/2632-2153/ae1bf8)
 
 
 
