@@ -6,7 +6,7 @@
 [Examples](./examples) |
 [Paper 1](https://doi.org/10.1088/2632-2153/ad8980) |
 [Paper 2](https://doi.org/10.1088/2632-2153/ae1bf8) |
-[Paper 3](https://web.atzberger.org/pmwiki_intranet/uploads/AtzbergerHomePage/preprint_Extending_Neural_Ops__Atzberger2026.pdf)
+[Paper 3](https://arxiv.org/abs/2603.03621)
                                                                                                 
 ### Geometric Neural Operators (GNPs) 
 
@@ -122,7 +122,7 @@ https://web.atzberger.org
 [Examples](./examples) |
 [Paper 1](https://doi.org/10.1088/2632-2153/ad8980) |
 [Paper 2](https://doi.org/10.1088/2632-2153/ae1bf8) | 
-[Paper 3](https://web.atzberger.org/pmwiki_intranet/uploads/AtzbergerHomePage/preprint_Extending_Neural_Ops__Atzberger2026.pdf)
+[Paper 3](https://arxiv.org/abs/2603.03621)
 
 
 
