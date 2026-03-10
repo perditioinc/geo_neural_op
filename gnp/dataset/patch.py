@@ -1,392 +1,481 @@
-import numpy as np
-import torch
+from functools import cached_property
 from typing import Optional
+
+import torch
 import torch_geometric as tg
-from scipy.spatial import KDTree
-from torch_geometric.data import Batch, Data
-from torch_geometric.nn import radius_graph
+from torch_geometric.data import Data
+from torch_scatter import scatter_add, scatter_max, scatter_mean
 
-from .pca import PCABatch
+from ..utils import QueryTorchGeometric
 
-def radius_graph(
-    x: torch.Tensor,
-    radius: float,
-    source_inds: Optional[torch.LongTensor] = None,
-    target_inds: Optional[torch.LongTensor] = None,
-    max_num_neighbors: int = 30,
-):
-    if target_inds is None:
-        target_inds = torch.arange(x.shape[0], device=x.device)
 
-    if source_inds is None:
-        source_inds = torch.arange(x.shape[0], device=x.device)
+class PatchData(Data):
+    """
+     A PyTorch Geometric Data object specialized for patch-based point cloud data.
 
-    tree = KDTree(x[source_inds].cpu().numpy())
-    radius_inds = tree.query_ball_point(x[target_inds].cpu().numpy(), r=radius)
+    This class extends the base `Data` object to include patch-specific
+    attributes and a utility for iterating over batches of patches.
+    """
 
-    def choose(array):
-        return np.random.choice(
-            array, size=min(max_num_neighbors, len(array)), replace=False
+    def __init__(self, x: Optional[torch.Tensor] = None, **kwargs):
+        super().__init__(x=x, **kwargs)
+
+    @property
+    def num_patches(self):
+        """Returns the number of patches in the dataset."""
+        return self.centers.shape[0] if "centers" in self else 0
+
+    def batch_iterator(self, batch_size: int):
+        """
+        Create a generator to iterate over batches of patches.
+
+        This method yields smaller `PatchData` objects, each containing a subset
+        of the patches. It assumes that the patch data is sorted by `patch_number`.
+
+        Parameters
+        ----------
+        batch_size : int
+            The maximum number of patches in each batch.
+
+        Yields
+        ------
+        PatchData
+            A new `PatchData` object representing a batch of patches.
+        """
+        num_patches = self.num_patches
+        batch_size = min(num_patches, batch_size)
+        ptr = torch.zeros(num_patches + 1, dtype=torch.long, device=self.x.device)
+        torch.cumsum(self.patch_lens, dim=0, out=ptr[1:])
+
+        for start_idx in range(0, num_patches, batch_size):
+            end_idx = min(start_idx + batch_size, num_patches)
+
+            batch_kwargs = {}
+            for key, value in self.to_dict().items():
+                if isinstance(value, torch.Tensor) and value.shape[0] == num_patches:
+                    batch_kwargs[key] = value[start_idx:end_idx]
+
+            edge_start = ptr[start_idx]
+            edge_end = ptr[end_idx]
+            total_edges = self.patch_indices.shape[0]
+            for key, value in self.to_dict().items():
+                if isinstance(value, torch.Tensor) and value.shape[0] == total_edges:
+                    sliced_val = value[edge_start:edge_end]
+                    if key == "patch_number":
+                        sliced_val = sliced_val - start_idx
+
+                    batch_kwargs[key] = sliced_val
+            yield PatchData(**batch_kwargs)
+
+
+class PatchTensor:
+    """
+    Processes a point cloud into a collection of overlapping patches.
+
+    This class handles the entire pipeline of patchifying a point cloud. It
+    selects patch centers, finds neighboring points for each patch, computes
+    local coordinate systems using PCA, and scales the coordinates. The final
+    output is a `PatchData` object ready for use in a model.
+
+    Parameters
+    ----------
+    data : dict
+        A dictionary containing the point cloud data, requires at least an
+        'x' key with a tensor of shape (N, 3).
+    k : int, optional
+        Number of nearest neighbors to consider for various calculations,
+        by default 30.
+    mode : str, optional
+        The mode for center selection ('train', 'test', or 'gmls'),
+        by default "test".
+    pca : bool, optional
+        Whether to use PCA to determine local coordinate systems,
+        by default True.
+    scale : bool, optional
+        Whether to scale the local coordinates, by default True.
+    min_z_scale : float, optional
+        The minimum value for z-scaling, by default 5e-3.
+    basis : str, optional
+        The basis to use, by default "legendre".
+    basis_degree : int, optional
+        The degree of the basis, by default 3.
+    num_training_patches : int, optional
+        Number of patches to sample in 'train' mode, by default 1024.
+    device : str, optional
+        The device to perform computations on, by default "cpu".
+    """
+
+    def __init__(
+        self,
+        data: dict,
+        k: int = 30,
+        mode: str = "test",
+        pca: bool = True,
+        scale: bool = True,
+        min_z_scale: float = 5e-3,
+        basis: str = "legendre",
+        basis_degree: int = 3,
+        num_training_patches: int = 1024,
+        device: str = "cpu",
+    ):
+        self.data = data
+        self.x = data["x"].squeeze().to(device)
+        self.original_x = data.get("original_x", self.x).squeeze().to(device)
+
+        for key, val in data.items():
+            if isinstance(val, torch.Tensor):
+                self.data[key] = val.to(device)
+        self.k = k
+        self.mode = mode
+        self.pca = pca
+        self.scale = scale
+        self.min_z_scale = min_z_scale
+        self.basis = basis
+        self.basis_degree = basis_degree
+        self.num_training_patches = num_training_patches
+        self.device = device
+
+        self.query = QueryTorchGeometric(x=self.x, device=self.device)
+        self.center_indices, self.clusters, self.knn_distances = self.get_centers()
+        self.patch_indices, self.patch_number, self.patch_lens = (
+            self._patch_data_query()
+        )
+        self.centers = scatter_mean(
+            self.x[self.patch_indices], index=self.patch_number, dim=0
         )
 
-    cols = list(map(choose, radius_inds))
-    lengths = torch.LongTensor(list(map(len, cols)))
+    def get_centers(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Dispatch method to get patch centers based on the current mode.
 
-    cols = torch.LongTensor(np.concatenate(cols))
-    rows = torch.repeat_interleave(target_inds, lengths)
-
-    edges = torch.stack((cols, rows)).to(x.device)
-    return edges
-
-def graph_from_dict(sample: dict, 
-                    radius: float, 
-                    max_num_neighbors: int=32):
-    """
-    Construct a graph from a dictionary of node features and other data.
-
-    Parameters
-    ----------
-    sample : dict
-        Dictionary containing the node features and other data.
-    radius : float
-        Radius for the radius graph.
-    max_num_neighbors : int, optional
-        Maximum number of neighbors per node. Defaults to 32.
-
-    Returns
-    -------
-    torch_geometric.data.Data
-        A graph data object containing node features, edge indices, and edge attributes.
-    """    
-    x = sample.get('x')
-    x_device = x.device
-    edge_data = sample.get('edge_data')
-    if edge_data is None:
-        edge_data = x
-
-    edge_ind = radius_graph(x, radius=radius, max_num_neighbors=max_num_neighbors)
-
-    edge_attr = edge_data[edge_ind.t()].reshape(-1, 2 * edge_data.shape[1])
-
-    data = Data(x=x,
-                edge_index=edge_ind,
-                edge_attr=edge_attr)
-    for k, v in sample.items():
-        if k not in ['x', 'edge_data']:
-            setattr(data, k, v)
-    return data.to(x_device)
-
-
-class PatchGenerator:
-    """
-    PatchLoader class that generates patches from a point cloud.
-    
-    Parameters
-    ----------
-        data : dict
-            Point cloud data. Must include keys 'x' for point cloud and 
-            'normals' which must have the correct orientation of the pointcloud.
-            The normals do not need to be accurate other than the orientation.
-        graph_radius : float
-            Radius for graph construction.
-        batch_size : int, optional
-            Batch size. Defaults to 1.
-        center : str, optional
-            Method for choosing patch centers. If 'tree', a KDTree is used to ensure patches 
-            completely cover the point cloud. If 'gmls', there is one patch for every point 
-            in the data. Defaults to 'tree'.
-        shuffle_patches : bool, optional
-            Whether to shuffle patches. Defaults to True.
-        knn : int, optional
-            Number of neighbors to choose for patch construction. Defaults to 50.
-        min_radius : float, optional
-            Minimum patch radius. Defaults to 0.01.
-        pca : bool, optional
-            If True, returns patch in local PCA coordinates. Defaults to True.
-        degree : int, optional
-            Maximum degree of 1D Legendre basis if pca is True. Defaults to 3.
-        orientation : Optional[torch.Tensor], optional
-            Orientation used if pca is True. Defaults to None.
-        scale : bool, optional
-            If True, scaling is used if pca is also True. Defaults to True.
-        include_scale : bool, optional
-            If True, includes scale in the output. Defaults to True.
-        min_z_scale : float, optional
-            Minimum scale used in pca rescaling. Defaults to 1e-3.
-        max_num_neighbors : int, optional
-            Maximum neighbors used in graph construction. Defaults to 32.
-        device : str, optional
-            Device to use. Defaults to 'cpu'.
-    """    
-    def __init__(self,
-                 data: dict,
-                 graph_radius: float,
-                 batch_size: int=1,
-                 center: str='tree',
-                 shuffle_patches: bool=True,
-                 knn: int=50,
-                 min_radius: float=0.01,
-                 pca: bool=True,
-                 degree: int=3,
-                 orientation: Optional[torch.Tensor]=None,
-                 min_z_scale: float=1e-3,
-                 max_num_neighbors: int=32,
-                 device: str ='cpu'):     
-        
-        self.current_idx = 0
-        self.data = data.copy()
-        for k, v in self.data.items():
-            if isinstance(v, torch.Tensor):
-                self.data[k] = v.cpu()
-        
-        self.x = self.data.get('x').squeeze(0)
-        self.graph_radius = graph_radius
-        self.batch_size = batch_size
-        self.shuffle = shuffle_patches
-        self.device = device
-        self.tree = KDTree(self.x.cpu().numpy())
-        self.center = center
-        self.knn = knn
-        self.min_radius = torch.tensor(min_radius)
-        self.centers = self.get_centers()
-        self.max_num_neighbors = max_num_neighbors
-        
-        if self.data.get('path') is not None:
-            self.data.pop('path')
-        
-        if self.shuffle:
-            self.order = torch.randperm(self.centers.shape[0])
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            A tuple containing:
+            - The indices of the center points.
+            - The cluster assignment for each point in the cloud.
+            - The k-NN distance for each center, used to determine patch radius.
+        """
+        if self.mode == "train":
+            return self.get_train_centers()
+        elif self.mode == "test":
+            return self.get_test_centers()
+        elif self.mode == "gmls":
+            return self.get_gmls_centers()
         else:
-            self.order = torch.arange(self.centers.shape[0])
+            raise ValueError(f"Unknown mode: {self.mode}")
 
-        self.center_data = self.x[self.centers]
-        self.num_patches = self.centers.shape[0]
+    def get_train_centers(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Select patch centers by random sampling for training.
 
-        knn_dist, self.knn_ind = self.tree.query(
-            self.center_data.cpu().numpy(), k=self.knn, eps=0.05
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor
+            Center indices, cluster assignments (dummy), and k-NN distances.
+        """
+        centers = torch.randperm(self.x.shape[0])[: self.num_training_patches]
+        clusters = torch.zeros((self.x.shape[0])).long()
+        distances, _ = self.query.query_knn(self.x[centers], k=self.k)
+
+        return (
+            centers.to(self.device),
+            clusters.to(self.device),
+            distances[:, -1].to(self.device),
+        )
+
+    def get_test_centers(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Select patch centers using a greedy covering strategy for testing.
+
+        This method iterates through shuffled points and selects a point as a
+        center if it's not already covered by an existing patch, effectively
+        creating a set of patches that cover the entire point cloud.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            Center indices, cluster assignments, and k-NN distances.
+        """
+        distances, ind = self.query.query_knn(self.x, k=self.k)
+        center_knn_ind = ind[:, : int(0.66 * self.k)].contiguous()
+
+        center_indices = []
+        mask = torch.ones(self.x.shape[0], dtype=torch.bool)
+        shuffled_indices = torch.randperm(self.x.shape[0])
+
+        for idx in shuffled_indices:
+            if mask[idx]:
+                center_indices.append(idx)
+                neighbors_to_cover = center_knn_ind[idx].flatten()
+                mask[neighbors_to_cover] = False
+        center_indices = torch.LongTensor(center_indices)
+        self.max_patches = center_indices.shape[0] + 1
+        knn_ind = ind[center_indices]
+        clusters = torch.zeros(self.x.shape[0], dtype=torch.long)
+        arange = torch.arange(center_indices.shape[0])
+        for j in range(ind.shape[1] - 1, -1, -1):
+            clusters[knn_ind[:, j]] = arange
+        return (
+            center_indices.to(self.device),
+            clusters.to(self.device),
+            distances[center_indices, -1],
+        )
+
+    def get_gmls_centers(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Select every point as a patch center for GMLS.
+
+        In GMLS mode, a patch is centered at every single point in the cloud.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            Center indices, cluster assignments, and k-NN distances.
+        """
+        distances, _ = self.query.query_knn(self.x, k=self.k)
+        return (
+            torch.arange(self.x.shape[0], device=self.device),
+            torch.arange(self.x.shape[0], device=self.device),
+            distances[:, -1],
+        )
+
+    def _patch_data_query(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Find all points within the radius of each patch center.
+
+        Uses a radius query to find all points belonging to each patch, defined
+        by the k-NN distance of the center point.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            A tuple containing:
+            - The indices of all points belonging to any patch.
+            - The patch number (i.e., center index) for each point.
+            - The number of points in each patch.
+        """
+        index_x, index_y = self.query.query_radius(
+            x=self.x,
+            y=self.x[self.center_indices],
+            radius=1.1 * self.knn_distances.max().item(),
+            max_num_neighbors=5 * self.k,
+        )
+        mask = (self.x[index_x] - self.x[self.center_indices[index_y]]).norm(dim=1) < (
+            1.1 * self.knn_distances
+        )[index_y]
+        patch_indices = index_x[mask]
+        patch_number = index_y[mask]
+        patch_lens = scatter_add(
+            torch.ones(patch_number.shape[0], device=self.device, dtype=torch.long),
+            patch_number,
+        )
+        return (
+            patch_indices.to(self.device),
+            patch_number.to(self.device),
+            patch_lens.to(self.device),
+        )
+
+    @cached_property
+    def tensor_centered(self):
+        """
+        Dense tensor of patch points, centered by subtracting the patch mean.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape (num_patches, max_points_in_patch, 3).
+        """
+        patch_tensor, _ = tg.utils.to_dense_batch(
+            x=self.x[self.patch_indices], batch=self.patch_number, fill_value=torch.inf
+        )
+        patch_tensor -= self.centers.unsqueeze(1)
+        return torch.nan_to_num(patch_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+    @cached_property
+    def _pca_data(self):
+        """
+        Compute PCA vectors and z-scaling for each patch.
+
+        This method calculates the principal component vectors for each patch.
+        It aligns the third component with the provided orientation (normals)
+        and ensures a right-handed coordinate system. It also computes a
+        z-scaling factor based on the standard deviation along the third
+        principal component.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor
+            A tuple containing:
+            - PCA vectors (num_patches, 3, 3).
+            - Z-axis scaling factor (num_patches, 1).
+        """
+        x_centered = self.x[self.patch_indices] - self.centers[self.patch_number]
+
+        outer_prod = x_centered.unsqueeze(2) * x_centered.unsqueeze(1)
+        cov_matrices = scatter_add(outer_prod, self.patch_number, dim=0)
+
+        _, S_squared, Vh = torch.linalg.svd(cov_matrices)
+        S = S_squared.sqrt()
+
+        pca_vectors = Vh.clone()
+        if self.data.get("orientation", None) is not None:
+            orientation = self.data.get("orientation")[self.center_indices]
+        elif self.data.get("normals", None) is not None:
+            orientation = self.data.get("normals")[self.center_indices]
+        else:
+            orientation = self.x[self.center_indices]
+
+        flip_mask = (orientation * pca_vectors[:, 2]).sum(dim=-1) < 0.0
+        pca_vectors[flip_mask, 2] *= -1
+        cross_mask = (
+            torch.linalg.cross(pca_vectors[:, 0], pca_vectors[:, 1]) * pca_vectors[:, 2]
+        ).sum(dim=-1) < 0
+        pca_vectors[cross_mask, 1] *= -1
+        z_scale = S[:, 2] / (self.patch_lens - 1).sqrt()
+        z_mask = z_scale < self.min_z_scale
+        z_scale[z_mask] = self.min_z_scale
+        z_scale = z_scale.view(-1, 1)
+        return pca_vectors, z_scale
+
+    @cached_property
+    def _local_coordinate_data(self):
+        """
+        Compute local coordinates for points in each patch.
+
+        Projects the centered patch points onto the PCA basis and scales them.
+        The xy coordinates are scaled by the maximum xy-norm in the patch, and
+        the z coordinate is scaled by the pre-computed `z_scale`.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            A tuple containing:
+            - Scaled local coordinates for each point in a patch.
+            - The xy-scaling factor for each patch.
+        """
+        local_unscaled = (
+            (
+                (
+                    self.x[self.patch_indices] - self.centers[self.patch_number]
+                ).unsqueeze(1)
             )
-        self.knn_dist = torch.from_numpy(knn_dist[:, -1])
+            @ self.pca_vectors.permute(0, 2, 1)[self.patch_number]
+        ).squeeze(1)
+        xy_scale, _ = scatter_max(local_unscaled[:, :2].norm(dim=1), self.patch_number)
+        xy_scale = xy_scale.view(-1, 1)
+        scaling = torch.cat((xy_scale, xy_scale, self.z_scale), dim=1)
+        return local_unscaled / scaling[self.patch_number], xy_scale
 
-        if not hasattr(self, 'clusters'):
-            self.clusters = tg.nn.knn(self.center_data, self.x, k=1)[1].squeeze()
-            
-        self.patch_idx, self.buffer_idx = self.get_patch_indices()
-        self.pca = pca
-        self.degree = degree
-        self.min_z_scale = min_z_scale
-        
-    def get_centers(self) -> torch.LongTensor:
-
-        """        
-        Choose the centers of the patches.
-        If `self.center` is 'tree', the centers are chosen so that there is sufficient
-        coverage of the data. If `self.center` is 'gmls', there is one patch center
-        Returns
-        -------
-        torch.LongTensor
-            Indices of the patch centers.
-        """        
-        
-        if self.center == 'tree':
-            _, ind = self.tree.query(self.x.cpu().numpy(), k=int(0.66 * self.knn))
-            centers = []
-            mask = np.ones(self.x.shape[0], dtype=bool)
-            arange = np.arange(self.x.shape[0])
-            while mask.any():
-                idx = np.random.choice(arange[mask])
-                centers.append(idx)
-                mask[ind[idx]] = False
-            centers = torch.LongTensor(centers)
-            
-            knn_dist, self.knn_ind = self.tree.query(self.x.cpu()[centers].numpy(), 
-                                                          k=self.knn)
-            self.knn_dist = torch.from_numpy(knn_dist[:, -1])
-            
-            clusters = torch.zeros(self.x.shape[0], dtype=torch.long)
-            arange = torch.arange(self.knn_ind.shape[0])
-            for j in range(self.knn_ind.shape[1]-1, -1, -1):
-                clusters[self.knn_ind[:, j]] = arange
-            self.clusters = clusters
-            
-        elif self.center == 'gmls':
-            centers = torch.arange(self.x.shape[0])
-            knn_dist, self.knn_ind = self.tree.query(self.x.cpu().numpy(), 
-                                                          k=self.knn)
-            self.knn_dist = torch.from_numpy(knn_dist[:, -1])
-            self.clusters = centers.clone()
-            
-        return centers
-    
-    def get_patch_indices(self) -> tuple[list[int], list[int]]:
-        
+    @cached_property
+    def _local_coordinate_original_data(self):
         """
-        Returns indices of the patches and buffer regions.
-        Returns
-        -------
-        tuple of list of int
-            patch_idx : list of int
-                List of indices of the patches.
-            buffer_idx : list of int
-                List of indices of the buffer regions.
-        """     
-           
-        radii = torch.maximum(1.1 * self.knn_dist, self.min_radius).cpu().numpy()
-        patch_idx = self.tree.query_ball_point(self.center_data.cpu().numpy(),
-                                               r=radii, p=2, eps=0.01)
-        buffer_idx = self.tree.query_ball_point(self.center_data.cpu().numpy(),
-                                                r=1.25*radii, p=2, eps=0.01)
-        return patch_idx, buffer_idx
-        
-        
+        Compute local coordinates for the 'original' points.
 
-    def get_patch(self, idx: int) -> Data:
+        If `original_x` data is provided, this method computes the local
+        coordinates for those points using the same transformation (PCA vectors
+        and scaling) derived from the primary point cloud.
         """
-        Returns a single patch in the form of a torch_geometric Data object.
+        x = self.data.get("original_x", None)
+        if x is None:
+            return None
+        else:
+            x = x.squeeze(0)
 
-        Parameters
-        ----------
-        idx : int
-            Index of the patch to return.
+        local_unscaled = (
+            ((x[self.patch_indices] - self.centers[self.patch_number]).unsqueeze(1))
+            @ self.pca_vectors.permute(0, 2, 1)[self.patch_number]
+        ).squeeze(1)
+
+        scaling = torch.cat((self.xy_scale, self.xy_scale, self.z_scale), dim=1)
+        return local_unscaled / scaling[self.patch_number]
+
+    @cached_property
+    def x_local(self):
+        """All points transformed into the local coordinate system of their assigned patch."""
+        if self.mode == "train":
+            return self.local_coordinates
+
+        local_unscaled = (
+            (self.x - self.centers[self.clusters]).unsqueeze(1)
+            @ self.pca_vectors[self.clusters].permute(0, 2, 1)
+        ).squeeze(1)
+        return local_unscaled / self.scaling[self.clusters]
+
+    @cached_property
+    def tensor_local(self):
+        """Dense tensor of patch points in local coordinates."""
+        local_unscaled = (
+            self.pca_vectors.unsqueeze(1) @ self.tensor_centered.unsqueeze(-1)
+        ).squeeze()
+        return local_unscaled / self.scaling.unsqueeze(1)
+
+    @property
+    def pca_vectors(self):
+        """The PCA vectors (local basis) for each patch."""
+        pca_vectors, _ = self._pca_data
+        return pca_vectors
+
+    @property
+    def z_scale(self):
+        """The z-axis scaling factor for each patch."""
+        _, z_scale = self._pca_data
+        return z_scale
+
+    @property
+    def local_coordinates(self):
+        """The scaled local coordinates of points within their respective patches."""
+        local_coordinates, _ = self._local_coordinate_data
+        return local_coordinates
+
+    @property
+    def local_coordinates_original(self):
+        """The scaled local coordinates of the 'original' points."""
+        local_coordinates_original = self._local_coordinate_original_data
+        return local_coordinates_original
+
+    @property
+    def xy_scale(self):
+        """The xy-plane scaling factor for each patch."""
+        _, xy_scale = self._local_coordinate_data
+        return xy_scale
+
+    @property
+    def scaling(self):
+        """The combined (x, y, z) scaling vector for each patch."""
+        return torch.cat((self.xy_scale, self.xy_scale, self.z_scale), dim=1)
+
+    def as_patch_data(self) -> PatchData:
+        """
+        Assemble and return the final `PatchData` object.
+
+        This method collects all computed attributes (patch indices, local
+        coordinates, PCA vectors, etc.) and any additional data from the input
+        dictionary into a single `PatchData` object.
 
         Returns
         -------
-        Data
-            torch_geometric Data object containing the patch and all the associated data.
-        """        
-        
-        eval_patch_idx = torch.tensor(self.patch_idx[idx])
-        buffer_patch_idx = torch.tensor(self.buffer_idx[idx])
-        
-        extra_patch_idx = torch.tensor([x for x in buffer_patch_idx 
-                                        if x not in eval_patch_idx])
-
-        patch_idx = torch.cat((eval_patch_idx, extra_patch_idx)).long()
-        
-        cluster_mask = (
-            self.clusters[patch_idx] == self.clusters[self.centers[idx]]
-            ).view(-1, 1)
-        mask = torch.cat((torch.ones_like(eval_patch_idx),
-                          torch.zeros_like(extra_patch_idx)), 
-                         dim=0).bool().view(-1, 1)
-        
-        patch_data = {}
+        PatchData
+            The fully processed patch data object.
+        """
+        data_dict = {
+            "x": self.x,
+            "x_original": self.original_x,
+            "mode": self.mode,
+            "clusters": self.clusters,
+            "centers": self.centers,
+            "center_indices": self.center_indices,
+            "patch_indices": self.patch_indices,
+            "patch_number": self.patch_number,
+            "patch_lens": self.patch_lens,
+            "local_coordinates": self.local_coordinates,
+            "local_coordinates_original": self.local_coordinates_original,
+            "pca_vectors": self.pca_vectors,
+            "z_scale": self.z_scale,
+            "xy_scale": self.xy_scale,
+            "degree": self.basis_degree,
+        }
         for k, v in self.data.items():
-            patch_data[k] = v.squeeze(0)[patch_idx]
-        
-        data = graph_from_dict(patch_data, 
-                               radius=self.graph_radius,
-                               max_num_neighbors=self.max_num_neighbors)
-
-        data.mask = mask
-        data.cluster_mask = cluster_mask
-        data.ind = patch_idx
-
-        return data
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.current_idx >= self.order.shape[0]:
-            raise StopIteration
-        else:
-            idx = self.current_idx
-            diff = min(self.order.shape[0] - self.current_idx, self.batch_size)
-            self.current_idx += diff
-        batch = Batch.from_data_list([self.get_patch(self.order[idx + i]) for i in range(diff)])
-        
-        if self.pca:
-            pca_mapper = PCABatch(num_graphs=batch.num_graphs,
-                                  degree=self.degree,
-                                  min_z_scale=self.min_z_scale)
-            return pca_mapper.to_pca(batch).to(self.device)
-        else:
-            return batch.to(self.device)
-
-
-class PatchLoader:
-    """
-    PatchLoader class that outputs a PatchGenerator instance when given PCD data.
-    
-    Parameters
-        ----------
-        graph_radius : float
-            Radius for graph construction.
-        batch_size : int, optional
-            Batch size. Defaults to 1.
-        center : str, optional
-            Method for choosing patch centers. If 'tree', a KDTree is used to ensure patches 
-            completely cover the point cloud. If 'gmls', there is one patch for every point 
-            in the data. Defaults to 'tree'.
-        shuffle_patches : bool, optional
-            Whether to shuffle patches. Defaults to True.
-        knn : int, optional
-            Number of neighbors to choose for patch construction. Defaults to 50.
-        min_radius : float, optional
-            Minimum patch radius. Defaults to 0.01.
-        pca : bool, optional
-            If True, returns patch in local PCA coordinates. Defaults to True.
-        degree : int, optional
-            Maximum degree of 1D Legendre basis if pca is True. Defaults to 3.
-        min_z_scale : float, optional
-            Minimum scale used in pca rescaling. Defaults to 1e-3.
-        max_num_neighbors : int, optional
-            Maximum neighbors used in graph construction. Defaults to 32.
-        device : str, optional
-            Device to use. Defaults to 'cpu'.
-    """    
-    def __init__(self,
-                 graph_radius: float,
-                 batch_size: int=1,
-                 center: str='tree',
-                 shuffle_patches: bool=True,
-                 knn: int=50,
-                 min_radius: float=0.01,
-                 pca: bool=True,
-                 degree: int=3,
-                 min_z_scale: float=1e-3,
-                 max_num_neighbors: int=32,
-                 device: str ='cpu'):
-       
-        self.graph_radius = graph_radius
-        self.batch_size = batch_size
-        self.shuffle = shuffle_patches
-        self.device = device
-        self.center = center
-        self.knn = knn
-        self.min_radius = min_radius
-        self.pca = pca
-        self.degree = degree
-        self.min_z_scale = min_z_scale
-        self.max_num_neighbors = max_num_neighbors
-        
-
-    def __call__(self, data: dict) -> PatchGenerator:
-        """
-        Returns a PatchGenerator object.
-
-        Parameters
-        ----------
-        data : dict
-            Point cloud data. Must include keys 'x' for point cloud and 
-            'normals' which must have the correct orientation of the pointcloud.
-            The normals do not need to be accurate other than the orientation.
-
-        Returns
-        -------
-        PatchGenerator
-            PatchGenerator object.
-        """        
-        return PatchGenerator(data=data,
-                              graph_radius=self.graph_radius,
-                              batch_size=self.batch_size,
-                              shuffle_patches=self.shuffle,
-                              center=self.center,
-                              knn=self.knn,
-                              min_radius=self.min_radius,
-                              pca=self.pca,
-                              degree=self.degree,
-                              min_z_scale=self.min_z_scale,
-                              max_num_neighbors=self.max_num_neighbors,
-                              device=self.device)
-
+            if k not in data_dict.keys():
+                data_dict[k] = v
+        return PatchData(**data_dict).to(self.device)

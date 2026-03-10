@@ -1,9 +1,15 @@
-graph_radius: 0.2
-batch_size: 128
-center: tree
-knn: 70
-shuffle_patches: true
-pca: true
-degree: 3
-min_z_scale: 0.03
-device: cpu
+model:
+  node_dim: 3
+  out_dim: 16
+  layers: [64, 64, 64, 64, 64, 64]
+  num_channels: 4
+  neurons: 256
+  nonlinearity: ReLU
+data:
+  k: 70
+  mode: test
+  scale: true
+  min_z_scale: 0.001
+  basis: legendre
+  basis_degree: 3
+

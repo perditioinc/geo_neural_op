@@ -1,108 +1,195 @@
 import torch
 import torch.nn as nn
-from typing import List
+from torch_geometric.data import Data
 from torch_geometric.nn import global_mean_pool
 
-from .layers import BlockConv
+from . import layers as _layers
 
-class BlockGNP(nn.Module):
+
+class GNP(nn.Module):
     """
-    Block Geometric Neural Operator
+    General purpose model for Geometric Neural Operators (GNPs).
+
+    This model consists of a lifting layer, multiple graph convolution blocks,
+    and a final projection layer.
 
     Parameters
     ----------
     node_dim : int
-        Dimension of the input node features.
+        Input dimension of node features.
     edge_dim : int
-        Dimension of the input edge features.
+        Input dimension of edge features.
     out_dim : int
-        Dimension of the output node features.
-    layers : list of int
-        List of integers representing the dimensions of the hidden layers.
-    num_channels : int
-        Number of blocks in the kernel factorization.
-    neurons : int
-        Number of neurons in the kernel MLP.
+        Output dimension.
+    layers : list[int]
+        List of hidden dimensions.
+    conv_name : str
+        Name of the convolution block class to use.
+    conv_args : dict
+        Arguments for the convolution block.
     nonlinearity : str
-        Nonlinearity to use in the hidden layers.
-    device : torch.device
-        Device to run the model on.
+        The name of the activation function to use.
+    skip_connection: bool
+        Whether to use a skip connection for each layer.
+    device : str
+        The device to place the model on. Defaults to "cuda".
     """
-    def __init__(self,
-                 node_dim: int,
-                 edge_dim: int,
-                 out_dim: int,
-                 layers: List[int],
-                 num_channels: int,
-                 neurons: int,
-                 nonlinearity: str,
-                 device: torch.device):
+
+    def __init__(
+        self,
+        node_dim: int,
+        edge_dim: int,
+        out_dim: int,
+        layers: list[int],
+        conv_name: str,
+        conv_args: dict,
+        nonlinearity: str,
+        skip_connection: bool,
+        device: str,
+    ):
         super().__init__()
         self.device = device
         self.layers = layers
         self.depth = len(layers) - 1
         self.edge_dim = edge_dim
         self.out_dim = out_dim
-        self.channels = num_channels
-        self.neurons = neurons
         self.nonlinearity = nonlinearity
         self.lift = nn.Linear(node_dim, layers[0])
         self.proj = nn.Linear(layers[-1], out_dim)
-        self.W = nn.ModuleList([nn.Linear(d_in, d_out) if d_in != d_out else nn.Identity()
-                                for d_in, d_out in zip(layers[:-1], layers[1:])])
-        self.mixes = nn.ModuleList([nn.Linear(d_out, d_out) for d_out in layers[1:]])
-        self.convs = nn.ModuleList([BlockConv(edge_dim,
-                                              d_in,
-                                              d_out,
-                                              self.channels,
-                                              neurons,
-                                              nonlinearity) for d_in, d_out in zip(layers[:-1], layers[1:])])
-        self.activ = getattr(nn, nonlinearity)()
-        self.num_parameters = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def forward(self, data):
+        self.activation = _layers.get_activation(nonlinearity)
+        self.num_parameters = sum(
+            p.numel() for p in self.parameters() if p.requires_grad
+        )
+        if not hasattr(_layers, conv_name):
+            raise ValueError(f"Convolution '{conv_name}' not found in {__name__}")
+        self.blocks = nn.ModuleList(
+            [
+                _layers.ConvolutionBlock(
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    edge_dim=edge_dim,
+                    nonlinearity=nonlinearity,
+                    conv_name=conv_name,
+                    conv_args=conv_args,
+                    skip=skip_connection,
+                )
+                for in_dim, out_dim in zip(layers[:-1], layers[1:])
+            ]
+        )
+
+    def forward(self, data: Data):
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        data : Data
+            PyG Data object containing x, edge_index, and edge_attr.
+
+        Returns
+        -------
+        torch.Tensor
+            Output features.
+        """
         x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
         x = self.lift(x)
-        for i in range(self.depth):
-            z = self.convs[i](x, edge_index, edge_attr)
-            x = self.W[i](x) + self.mixes[i](z)
-            if i < self.depth - 1:
-                x = self.activ(x)
+        for block in self.blocks[:-1]:
+            x = block(x=x, edge_index=edge_index, edge_attr=edge_attr)
+        x = self.blocks[-1](
+            x=x, edge_index=edge_index, edge_attr=edge_attr, use_activation=False
+        )
         x = self.proj(x)
         return x
-    
+
+
 class PatchGNP(nn.Module):
     """
-    Patch Geometric Neural Operator
+    Geometric Neural Operator for processing point cloud patches.
 
     Parameters
     ----------
-    model : torch.nn.Module
-        Model to use for processing the input data.
+    node_dim : int
+        The dimensionality of the input node features (e.g., 3 for xyz).
     out_dim : int
-        Dimension of the output basis.
-    device : torch.device
-        Device to run the model on.
+        The dimensionality of the final output vector for each patch.
+    layers : list[int]
+        A list of integers defining the width of each layer in the network.
+        The first element is the width after the initial lifting layer.
+    num_channels : int
+        The number of channels to use in the 'block' type convolution.
+    neurons : int
+        The number of neurons in the hidden layers of the MLPs within the
+        convolutional layers.
+    nonlinearity : str
+        The name of the activation function to use.
+    device : str
+        The device to place the model on. Defaults to "cuda".
     """
-    def __init__(self,
-                 model: nn.Module,
-                 out_dim: int,
-                 device: torch.device):
+
+    def __init__(
+        self,
+        node_dim: int,
+        out_dim: int,
+        layers: list[int],
+        num_channels: int,
+        neurons: int,
+        nonlinearity: str,
+        device: str = "cuda",
+    ):
         super().__init__()
-        self.model = model
-        self.device = device
+        self.node_dim = node_dim
         self.out_dim = out_dim
-        self.v_dim = model.out_dim
-        self.nonlinearity = model.nonlinearity
-        self.activ = getattr(nn, self.nonlinearity)()
-        self.mlp = nn.Sequential(nn.Linear(self.v_dim, 2 * self.v_dim),
-                                 self.activ,
-                                 nn.Linear(2 * self.v_dim, self.out_dim))
+        self.layer_widths = layers
+        self.num_channels = num_channels
+        self.neurons = neurons
+        self.nonlinearity = nonlinearity
+        self.device = device
 
-        self.num_parameters = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        self.activation = _layers.get_activation(nonlinearity)
+        self.lift = nn.Linear(node_dim, layers[0])
+        self.proj = nn.Sequential(
+            nn.Linear(layers[-1], 2 * layers[-1]),
+            self.activation,
+            nn.Linear(2 * layers[-1], out_dim),
+        )
 
-    def forward(self, data):
-        x = self.model(data)
-        x = global_mean_pool(x[data.mask], batch=data.batch[data.mask])
-        x = self.mlp(x)
-        return x
+        self.convs = nn.ModuleList(
+            [
+                _layers.PatchSeparableBlockFactorizedConvolutionBlock(
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    dim_x=node_dim,
+                    num_channels=num_channels,
+                    neurons=neurons,
+                    nonlinearity=nonlinearity,
+                )
+                for in_dim, out_dim in zip(layers[:-1], layers[1:])
+            ]
+        )
+
+    def forward(self, x: torch.Tensor, batch: torch.Tensor):
+        """
+        Perform a forward pass on a batch of patches.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input coordinates/features (N, node_dim).
+        batch : torch.Tensor
+            Batch indices (N,).
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape (num_patches, out_dim) containing the output
+            vector for each patch.
+        """
+
+        v = self.lift(x)
+        for i, conv in enumerate(self.convs):
+            v = conv(x, v, batch)
+            if i < len(self.convs) - 1:
+                v = self.activation(v)
+        v = global_mean_pool(v, batch)
+        return self.proj(v)

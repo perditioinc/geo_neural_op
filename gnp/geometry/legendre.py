@@ -1,250 +1,378 @@
+from typing import Optional
+
 import torch
 from scipy.special import legendre
-from typing import Optional
+
 
 class Legendre1D:
     """
-    Class to compute the Legendre polynomials and their derivatives
-    """    
-    def __init__(self, degree: int=3):
+    Computes 1D Legendre polynomials and their derivatives.
+
+    This class pre-computes the coefficients of Legendre polynomials up to a
+    specified degree and provides methods to evaluate the polynomials and their
+    derivatives on batches of input data.
+
+    Parameters
+    ----------
+    degree : int
+        The maximum degree of the Legendre polynomials, by default 3.
+    """
+
+    def __init__(self, degree: int = 3):
         self.degree = degree
         self.legendres = [torch.Tensor(legendre(i).coef) for i in range(degree + 1)]
-    
+
     def evaluate(self, x: torch.Tensor) -> torch.Tensor:
-        
         """
-        Evaluate the Legendre polynomials at the input points.
+        Evaluate Legendre polynomials P_0(x), ..., P_degree(x).
 
         Parameters
         ----------
         x : torch.Tensor
-            Input points.
+            Input tensor of any shape.
 
         Returns
         -------
         torch.Tensor
-            Legendre polynomials evaluated at the input points.
-        """        
+            A tensor of shape (*x.shape, degree + 1) containing the evaluated
+            polynomials for each input value.
+        """
+
         xs = torch.stack([x.pow(i) for i in range(self.degree, -1, -1)], dim=-1)
         xs = torch.stack(
-            [(self.legendres[i].to(x.device) * xs[..., -i-1:]).sum(dim=-1) 
-             for i in range(self.degree+1)], dim=-1)
+            [
+                (self.legendres[i].to(x.device) * xs[..., -i - 1 :]).sum(dim=-1)
+                for i in range(self.degree + 1)
+            ],
+            dim=-1,
+        )
         return xs
 
-    def first_derivative(self, x: torch.Tensor) -> torch.Tensor:
-        
+    def gradient(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Compute the derivative of the Legendre polynomials at the input points.
+        Compute the first derivative of the Legendre polynomials.
 
         Parameters
         ----------
         x : torch.Tensor
-            Input points.
+            Input tensor of any shape.
 
         Returns
         -------
         torch.Tensor
-            Derivative of Legendre polynomials evaluated at the input points.
-        """ 
-        xs = torch.stack([i * x.pow(i-1) for i in range(self.degree, -1, -1)], dim=-1)
-        xs = torch.nan_to_num(xs, nan=0.0)
-        dxs = torch.stack(
-            [(self.legendres[i].to(x.device) * xs[..., -i-1:]).sum(dim=-1) 
-             for i in range(self.degree+1)], dim=-1)
-        return dxs
-
-    def second_derivative(self, x: torch.Tensor) -> torch.Tensor:
+            A tensor containing the first derivatives.
         """
-        Compute the second derivative of the Legendre polynomials at the input points
+
+        return self.derivative(x, order=1)
+
+    def hessian(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the second derivative of the Legendre polynomials.
 
         Parameters
         ----------
         x : torch.Tensor
-            Input points.
+            Input tensor of any shape.
 
         Returns
         -------
         torch.Tensor
-            Second derivative of Legendre polynomials evaluated at the input points.
-        """        
-        xs = torch.stack([i * (i-1) * x.pow(i-2) for i in range(self.degree, -1, -1)], dim=-1)
-        xs = torch.nan_to_num(xs, nan=0.0)
-        ddxs = torch.stack(
-            [(self.legendres[i].to(x.device) * xs[..., -i-1:]).sum(dim=-1) 
-             for i in range(self.degree+1)], dim=-1)
-        return ddxs
-    
+            A tensor containing the second derivatives.
+        """
+
+        return self.derivative(x, order=2)
+
+    def derivative(self, x: torch.Tensor, order: int) -> torch.Tensor:
+        """
+        Compute the n-th order derivative of the Legendre polynomials.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of any shape.
+        order : int
+            The order of the derivative to compute.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape (*x.shape, degree + 1) containing the evaluated
+            derivatives.
+        """
+
+        assert order > 0
+
+        xs = torch.stack(
+            [
+                torch.prod(torch.arange(i + 1 - order, i + 1)) * x.pow(i - order)
+                if i - order >= 0
+                else torch.zeros_like(x)
+                for i in range(self.degree, -1, -1)
+            ],
+            dim=-1,
+        )
+        derivatives = torch.stack(
+            [
+                (self.legendres[i].to(x.device) * xs[..., -i - 1 :]).sum(dim=-1)
+                for i in range(self.degree + 1)
+            ],
+            dim=-1,
+        )
+        return derivatives
+
+
 class Legendre2D:
-    def __init__(self, degree: int=3):
-        self.degree = degree
-        self.legendre1d = Legendre1D(degree=self.degree)
+    """
+    Computes a 2D Legendre basis from the tensor product of 1D polynomials.
 
-    def evaluate(self, xy_data: torch.Tensor) -> torch.Tensor:
-        
+    This class constructs a basis of 2D functions L_{i,j}(u,v) = P_i(u) * P_j(v)
+    and provides methods to evaluate the basis functions and their derivatives.
+
+    Parameters
+    ----------
+    degree : int
+        The maximum degree for the 1D Legendre polynomials used to
+        construct the 2D basis.
+    """
+
+    def __init__(self, degree: int):
+
+        super().__init__()
+        self._degree = degree
+        self.legendre_1d = Legendre1D(degree)
+
+    @property
+    def degree_indices(self):
         """
-        Evaluate tensor product of Legendre polynomials at the input points.
+        Get the pairs of degrees (i, j) for each 2D basis function.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape (2, num_components) where each column is a
+            pair of degrees [i, j].
+        """
+
+        indices = torch.nonzero(torch.ones(self._degree + 1, self._degree + 1)).T
+        return indices
+
+    @property
+    def num_components(self):
+        """The total number of basis functions in the 2D basis."""
+
+        return self.degree_indices.shape[1]
+
+    def evaluate(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate all 2D basis functions L_{i,j}(u,v) at given (u,v) coordinates.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (..., 2) containing (u,v) coordinates.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape (..., num_components) containing the evaluated
+            2D basis functions.
+        """
+
+        u = self.legendre_1d.evaluate(x[..., 0])[..., self.degree_indices[0]]
+        v = self.legendre_1d.evaluate(x[..., 1])[..., self.degree_indices[1]]
+        return u * v
+
+    def gradient(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the gradient of each 2D basis function.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (..., 2) containing (u,v) coordinates.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape (..., 2, num_components) where the second-to-last
+            dimension corresponds to the partial derivatives [dL/du, dL/dv].
+        """
+
+        u = self.legendre_1d.evaluate(x[..., 0])[..., self.degree_indices[0]]
+        v = self.legendre_1d.evaluate(x[..., 1])[..., self.degree_indices[1]]
+
+        du = self.legendre_1d.derivative(x[..., 0], order=1)[
+            ..., self.degree_indices[0]
+        ]
+        dv = self.legendre_1d.derivative(x[..., 1], order=1)[
+            ..., self.degree_indices[1]
+        ]
+        return torch.stack((du * v, u * dv), dim=-2)
+
+    def hessian(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the Hessian matrix for each 2D basis function.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (..., 2) containing (u,v) coordinates.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape (..., 2, 2, num_components) representing the
+            Hessian matrix [[d2L/du2, d2L/dudv], [d2L/dvdu, d2L/dv2]] for each
+            basis function.
+        """
+
+        u = self.legendre_1d.evaluate(x[..., 0])[..., self.degree_indices[0]]
+        v = self.legendre_1d.evaluate(x[..., 1])[..., self.degree_indices[1]]
+
+        du = self.legendre_1d.derivative(x[..., 0], order=1)[
+            ..., self.degree_indices[0]
+        ]
+        dv = self.legendre_1d.derivative(x[..., 1], order=1)[
+            ..., self.degree_indices[1]
+        ]
+
+        ddu = self.legendre_1d.derivative(x[..., 0], order=2)[
+            ..., self.degree_indices[0]
+        ]
+        ddv = self.legendre_1d.derivative(x[..., 1], order=2)[
+            ..., self.degree_indices[1]
+        ]
+
+        hessian = torch.stack((ddu * v, du * dv, du * dv, u * ddv), dim=-2)
+        return hessian.reshape(*x.shape[:-1], 2, 2, self.num_components)
+
+    def evaluate_from_coeffs(
+        self,
+        xy_data: torch.Tensor,
+        coeffs: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Evaluate a function defined by coefficients on the Legendre basis.
+
+        The function is f(u,v) = sum(coeffs * L_{i,j}(u,v)).
 
         Parameters
         ----------
         xy_data : torch.Tensor
-            (n, 2) tensor of input points.
+            Input tensor of shape (N, 2) with (u,v) coordinates.
+        coeffs : torch.Tensor
+            Coefficients for the Legendre basis. Can be shape (M, num_components)
+            if using batch, or (N, num_components) otherwise.
+        batch : torch.Tensor, optional
+            A tensor of shape (N,) mapping each point in xy_data to a set of
+            coefficients. If None, coeffs must be shape (N, num_components).
+            Defaults to None.
 
         Returns
         -------
         torch.Tensor
-            (n, (degree + 1) ** 2) tensor of Legendre polynomials evaluated at the input points.
+            A tensor of shape (N, 1) with the evaluated function values.
         """
-        x = xy_data[..., 0]
-        y = xy_data[..., 1]
-        size = x.size()
-        xs = self.legendre1d.evaluate(x).view(*size, 1, self.degree + 1)
-        ys = self.legendre1d.evaluate(y).view(*size, self.degree + 1, 1)
-        legendre_values = xs * ys
-        return legendre_values.flatten(start_dim=-2)
-    
-    def evaluate_from_coeffs(self, 
-                             xy_data: torch.Tensor, 
-                             coeffs: torch.Tensor, 
-                             batch: Optional[torch.LongTensor]=None) -> torch.Tensor:
-        """
-        Evaluate a function at given points from its Legendre coefficients
 
-        Args:
-            xy_data (torch.Tensor): (n, 2) tensor of input points
-            coeffs (torch.Tensor): tensor of legendre coefficients
-            batch (Optional[torch.LongTensor], optional): batch indices for parallel
-                computation over many batches. Defaults to None.
-
-        Returns:
-            torch.Tensor: (n, 1) tensor of function values at the input points
-        """        
         legendre_values = self.evaluate(xy_data)
         return self.compute_from_coeffs(legendre_values, coeffs, batch)
 
-    def compute_from_coeffs(self, 
-                            values: torch.Tensor, 
-                            coeffs: torch.Tensor, 
-                            batch: Optional[torch.LongTensor]=None) -> torch.Tensor:
+    def compute_from_coeffs(
+        self,
+        values: torch.Tensor,
+        coeffs: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
+    ):
         """
-        Compute function values using Legendre coefficients.
+        Compute a linear combination of values and coefficients.
+
+        This is a helper to compute `sum(coeffs * values)`.
 
         Parameters
         ----------
         values : torch.Tensor
-            Values of the Legendre polynomials (or derivatives) at the input points.
+            The pre-evaluated values, e.g., basis functions or their derivatives.
+            Shape (N, num_components).
         coeffs : torch.Tensor
-            Legendre basis coefficients.
-        batch : Optional[torch.LongTensor], optional
-            Batch indices. Defaults to None.
+            The coefficients. Shape (M, num_components) or (N, num_components).
+        batch : torch.Tensor, optional
+            Mapping from N points to M coefficient sets. Defaults to None.
 
         Returns
         -------
         torch.Tensor
-            (n, 1) tensor of function values at the input points.
-        """    
-            
+            The result of the linear combination, shape (N, 1).
+        """
+
         if batch is None:
             return (coeffs * values).sum(dim=-1).unsqueeze(-1)
         else:
             return (coeffs[batch] * values).sum(dim=-1).unsqueeze(-1)
 
-    def evaluate_derivatives(self, xy_data: torch.TensorType) -> tuple[torch.Tensor]:
+    def evaluate_derivatives(
+        self, xy_data: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Evaluate the derivatives of the Legendre polynomials at the input points.
+        Evaluate all first and second order partial derivatives of the basis.
 
         Parameters
         ----------
         xy_data : torch.Tensor
-            (n, 2) tensor of input points.
+            Input (u,v) coordinates of shape (..., 2).
 
         Returns
         -------
-        tuple of torch.Tensor
-            Derivatives of the Legendre polynomials evaluated at the input points.
-        """  
-              
-        x = xy_data[..., 0]
-        y = xy_data[..., 1]
-        size = x.size()
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+            A tuple of tensors: (dx, dy, dxdy, dxdx, dydy), each containing
+            the evaluations of the corresponding partial derivative for every
+            basis function.
+        """
 
-        xs = self.legendre1d.evaluate(x).view(*size, 1, self.degree + 1)
-        ys = self.legendre1d.evaluate(y).view(*size, self.degree + 1, 1)
-
-        dxs = self.legendre1d.first_derivative(x).view(*size, 1, self.degree + 1)
-        dys = self.legendre1d.first_derivative(y).view(*size, self.degree + 1, 1)
-
-        ddxs = self.legendre1d.second_derivative(x).view(*size, 1, self.degree + 1)
-        ddys = self.legendre1d.second_derivative(y).view(*size, self.degree + 1, 1)
-
-        dx = (dxs * ys).squeeze(0).flatten(start_dim=-2)
-        dy = (xs * dys).squeeze(0).flatten(start_dim=-2)
-
-        dxdy = (dxs * dys).squeeze(0).flatten(start_dim=-2)
-        dxdx = (ddxs * ys).squeeze(0).flatten(start_dim=-2)
-        dydy = (xs * ddys).squeeze(0).flatten(start_dim=-2)
+        dx, dy = self.gradient(xy_data).unbind(dim=-2)
+        dxdx, dxdy, _, dydy = (
+            self.hessian(xy_data).flatten(start_dim=-3, end_dim=-2).unbind(dim=-2)
+        )
 
         return dx, dy, dxdy, dxdx, dydy
 
-    def derivatives_from_coeffs(self, 
-                                xy_data: torch.Tensor, 
-                                coeffs: torch.Tensor, 
-                                batch: Optional[torch.LongTensor]=None) -> torch.Tensor:
+    def derivatives_from_coeffs(
+        self,
+        xy_data: torch.Tensor,
+        coeffs: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        Compute the derivatives of a function at given points from its Legendre coefficients.
+        Compute derivatives of a function defined by coefficients.
+
+        The function is f(u,v) = sum(coeffs * L_{i,j}(u,v)). This method computes
+        df/du, df/dv, d2f/dudv, d2f/du2, and d2f/dv2.
 
         Parameters
         ----------
         xy_data : torch.Tensor
-            (n, 2) tensor of input points.
+            Input (u,v) coordinates of shape (N, 2).
         coeffs : torch.Tensor
-            Tensor of Legendre coefficients.
-        batch : Optional[torch.LongTensor], optional
-            Batch indices for parallel computation over many batches. Defaults to None.
+            Coefficients for the Legendre basis.
+        batch : torch.Tensor, optional
+            Mapping from points to coefficient sets. Defaults to None.
 
         Returns
         -------
         torch.Tensor
-            (n, 5) tensor of function derivatives at the input points.
+            A tensor of shape (N, 5) containing the five derivative values for
+            each point.
         """
-        
+
         dx, dy, dxdy, dxdx, dydy = self.evaluate_derivatives(xy_data)
-        derivatives = torch.cat((self.compute_from_coeffs(dx, coeffs, batch),
-                                 self.compute_from_coeffs(dy, coeffs, batch),
-                                 self.compute_from_coeffs(dxdy, coeffs, batch),
-                                 self.compute_from_coeffs(dxdx, coeffs, batch),
-                                 self.compute_from_coeffs(dydy, coeffs, batch)),
-                                dim=-1)
-
+        derivatives = torch.cat(
+            (
+                self.compute_from_coeffs(dx, coeffs, batch),
+                self.compute_from_coeffs(dy, coeffs, batch),
+                self.compute_from_coeffs(dxdy, coeffs, batch),
+                self.compute_from_coeffs(dxdx, coeffs, batch),
+                self.compute_from_coeffs(dydy, coeffs, batch),
+            ),
+            dim=-1,
+        )
         return derivatives
-
-    def batch_ls_best_fit(self, 
-                          x: torch.Tensor, 
-                          batch: Optional[torch.LongTensor]=None) -> torch.Tensor:
-        """
-        Compute the least squares best fit of the Legendre coefficients.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            (n, 2) tensor of input points.
-        batch : Optional[torch.LongTensor], optional
-            Batch indices. Defaults to None.
-
-        Returns
-        -------
-        torch.Tensor
-            (num_batches, (degree + 1) ** 2) tensor of Legendre coefficients.
-        """        
-        
-        device = x.device
-        x = x.cpu()
-        if batch is None:
-            batch = torch.zeros(x.size(0), dtype=torch.long)
-        batch = batch.cpu()
-        num_batches = batch.max().item() + 1
-        legvals = [self.evaluate(x[batch == i]) for i in range(num_batches)]
-        xs = [x[batch == i, 2].view(-1, 1) for i in range(num_batches)]
-        out = torch.cat(
-            [torch.linalg.lstsq(A, b, driver='gelsd').solution.view(1, -1) for A, b in zip(legvals, xs)], dim=0
-            ).to(device)
-        return out

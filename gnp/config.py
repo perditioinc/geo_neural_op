@@ -1,8 +1,10 @@
+from pathlib import Path
+
 import torch
 import yaml
-from pathlib import Path
-from .models.gnp import PatchGNP, BlockGNP
-from .dataset.patch import PatchLoader
+
+from .models.gnp import PatchGNP
+
 
 def load_config(path: Path) -> dict:
     """
@@ -18,12 +20,15 @@ def load_config(path: Path) -> dict:
     dict
         Dictionary containing the configuration parameters.
     """
-    assert path.exists()
-    with open(path, 'r') as file:
+    if not path.exists():
+        raise OSError(f"Path {path} Not Found")
+
+    with open(path, "r") as file:
         cfg = yaml.safe_load(file)
     return cfg
 
-def load_model(model_path: Path) -> PatchGNP:
+
+def load_model(config: dict, model_path: Path, device: str) -> PatchGNP:
     """
     Load a model from a directory.
 
@@ -34,35 +39,13 @@ def load_model(model_path: Path) -> PatchGNP:
 
     Returns
     -------
-    torch.nn.Module
+    PatchGNP
         The loaded model.
-    """    
-    assert model_path.exists()
-    
-    backbone = BlockGNP(node_dim=3,
-                        edge_dim=6,
-                        out_dim=64,
-                        layers=6*[64],
-                        num_channels=4,
-                        nonlinearity='ReLU',
-                        neurons=256,
-                        device='cpu')
-    model = PatchGNP(model=backbone,
-                     out_dim=16,
-                     device='cpu')
-    model.load_state_dict(torch.load(model_path, map_location='cpu'))
-    
-    return model
-
-def load_patchloader(cfg: dict, **kwargs) -> PatchLoader:
     """
-    Load a PatchLoader using a yaml file in data_dir.
+    if not model_path.exists():
+        raise OSError(f"Path {model_path} Not Found")
 
-    Parameters
-    ----------
-    cfg: dict
-        Dictionary containing the configuration parameters.
-    """    
-    for k, v in kwargs.items():
-        cfg[k] = v
-    return PatchLoader(**cfg)
+    model = PatchGNP(device=device, **config)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+
+    return model.to(device)

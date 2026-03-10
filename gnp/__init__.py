@@ -1,4 +1,3 @@
 from .models.gnp import PatchGNP
-from .dataset.patch import PatchLoader
-from .geometry.surface import SurfacePatch
+from .geometry.surface import Surface
 from .estimator import GeometryEstimator

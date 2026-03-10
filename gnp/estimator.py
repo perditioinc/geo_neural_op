@@ -1,380 +1,439 @@
-import numpy as np
-import torch
-import torch.nn.functional as F
 from pathlib import Path
 from typing import Optional
-from torch_geometric.data import Batch
-from torch_geometric.nn import fps
-from tqdm import tqdm
+
+import numpy as np
 import scipy.sparse as sp
+import torch
+import torch.nn.functional as F
+import torch_geometric as tg
+from tqdm import tqdm
 
-from .config import load_config, load_model, load_patchloader
-from .geometry.surface import SurfacePatch
-from .utils import smooth_values_by_gaussian, subsample_points_by_radius 
+from .config import load_config, load_model
+from .dataset.patch import PatchData, PatchTensor
+from .geometry.surface import Surface
+from .utils import smooth_values_by_gaussian, subsample_points_by_radius
 
-MODEL_PATH = Path.joinpath(Path(__file__).parent, 'model_weights')
+MODULE_PATH = Path(__file__).parent
+
 
 class GeometryEstimator:
     """
-    Geometry estimator for a point cloud.
+    Class used for geometry estimation using the pre-trained PatchGNP.
 
     Parameters
     ----------
     pcd : torch.Tensor
-        Point cloud data.
+        Point cloud data (N, 3).
     orientation : torch.Tensor
-        Orientation data.
-    function_values : Optional[torch.Tensor]
-        Function values for the point cloud.
-    model : str
-        Model name.
-    device : torch.device
-        Device to run the model on.
-    data : dict
-        Dictionary containing the input data.
-    model_path : Path
-        Path to the model state dictionary.
-    model : nn.Module
-        Loaded model.
-    config_path : Path
-        Path to the configuration file.
-    cfg : dict
-        Configuration dictionary.
-    patch_loader : PatchLoader
-        Patch loader object.
+        Normal vectors for each point (N, 3).
+    function_values : torch.Tensor, optional
+        Function values defined on the point cloud, by default None.
+    model_name : str
+        Name of the pre-trained model to use, by default "clean_30k".
+        Options: "clean_30k", "clean_50k", "noise_70k", "outlier_50k".
+    batch_size : int, optional
+        Batch size for processing patches, by default 8192.
+    device : str, optional
+        Device to run the model on, by default "cpu".
+    **data_kwargs :
+        Additional keyword arguments for data configuration. These will
+        override the default data configurations.
     """
-    
-    
-    def __init__(self, 
-                 pcd: torch.Tensor,
-                 orientation: torch.Tensor,
-                 function_values: Optional[torch.Tensor]=None,
-                 model: str='clean_30k',
-                 device: torch.device='cpu',
-                 **patch_kwargs: Optional[dict]):
-        
-        assert model in ['clean_30k', 'clean_50k', 'noise_70k', 'outlier_50k']
+
+    def __init__(
+        self,
+        pcd: torch.Tensor,
+        orientation: torch.Tensor,
+        function_values: Optional[torch.Tensor] = None,
+        model_name: str = "clean_30k",
+        batch_size: int = 8192,
+        device: str = "cpu",
+        **data_kwargs: Optional[dict],
+    ):
+        assert model_name in ["clean_30k", "clean_50k", "noise_70k", "outlier_50k"]
         self.pcd = pcd.to(device)
         self.orientation = orientation.to(device)
         self.device = device
-        
-        self.data = {'x': self.pcd, 
-                     'normals': self.orientation}
-        
-        self.model_path = Path.joinpath(MODEL_PATH, model, 'state_dict.pth')
-        self.model = load_model(self.model_path)
+
+        self.data = {"x": self.pcd, "normals": self.orientation}
+
+        self.config = load_config(
+            MODULE_PATH / "model_weights" / model_name / "config.yaml"
+        )
+
+        self.model_path = MODULE_PATH / "model_weights" / model_name / "state_dict.pth"
+        self.model = load_model(
+            config=self.config["model"], model_path=self.model_path, device=device
+        )
         self.model.to(device)
-        
-        self.config_path = Path.joinpath(MODEL_PATH, model, 'config.yaml')
-        self.cfg = load_config(self.config_path)
-        self.cfg['device'] = device
-        self.patch_loader = load_patchloader(self.cfg, **patch_kwargs)
-        
+        self.batch_size = batch_size
+
         if function_values is not None:
             self.function_values = function_values.to(device)
-            self.data['function_values'] = self.function_values
-    
-    def surface_patch(self, patch_data: Batch) -> SurfacePatch:
+            self.data["function_values"] = self.function_values
+
+        for k, v in data_kwargs.items():
+            self.config["data"][k] = v
+
+    def patch_data(self, **datakwargs) -> PatchData:
         """
-        Create a SurfacePatch from the input patch data.
-        
+        Create a PatchData object from the point cloud data.
+
+        This method configures and generates patches from the input point cloud
+        data, which can then be used by the model for predictions.
+
         Parameters
         ----------
-        patch_data : Batch
-            Batch containing the input patch data.
-        
+        **datakwargs :
+            Keyword arguments to override data configuration settings.
+
         Returns
         -------
-        SurfacePatch
-            SurfacePatch object.
+        PatchData
+            A PatchData object containing the point cloud data structured into patches.
         """
-        with torch.no_grad():
-            surface_coefficients = self.model(patch_data)
-        return SurfacePatch(patch_data, surface_coefficients)
-    
-    def estimate_quantities(self, scalar_names: list[str]) -> dict:
+
+        data_config = self.config["data"]
+        for k, v in datakwargs.items():
+            data_config[k] = v
+        return PatchTensor(
+            data=self.data, device=self.device, **data_config
+        ).as_patch_data()
+
+    def surface_patch(self, patch_data: Optional[PatchData] = None) -> Surface:
         """
-        Estimate geometric quantities on the point cloud. This function returns 
+        Create a Surface from the input patch data using the predictions from
+        the model.
+
+        Parameters
+        ----------
+        patch_data : PatchData, optional
+            Batch containing the input patch data. If patch_data is None defaults
+            to self.patch_data()
+
+        Returns
+        -------
+        Surface
+            Surface object.
+        """
+        if patch_data is None:
+            patch_data = self.patch_data()
+        surface_coefficients = []
+        for pd in patch_data.batch_iterator(self.batch_size):
+            x, batch = pd.local_coordinates, pd.patch_number
+            with torch.no_grad():
+                surface_coefficients.append(self.model(x, batch))
+        return Surface(patch_data, torch.cat(surface_coefficients, dim=0))
+
+    def estimate_quantities(self, quantity_names: list[str]) -> dict[str, torch.Tensor]:
+        """
+        Estimate geometric quantities on the point cloud. This function returns
         a dictionary containing the estimated scalar and/or vector values.
 
-        Args:
-            scalar_names (list[str]): List of scalar names to estimate. This can
-                be any of the following: 'xyz_coordinates', 'normals', 'tangents', 
-                'mean_curvature', 'gaussian_curvature', 'pca_coordinates', 'normals_pca',
-                'tangents_pca', 'metric', 'shape', 'weingarten', 'inverse_metric',
-                'inverse_metric_derivatives', 'det_metric', 'laplace_beltrami_from_coefficients'
+        Parameters
+        ----------
+        quantity_names : list[str]
+            List of quantity names to estimate. Available quantities include:
+            'xyz_coordinates', 'normals', 'tangents', 'mean_curvature',
+            'gaussian_curvature', 'pca_coordinates', 'normals_pca',
+            'tangents_pca', 'metric', 'shape', 'weingarten', 'inverse_metric',
+            'inverse_metric_derivatives', 'det_metric',
+            'laplace_beltrami_from_coefficients'.
 
-        Returns:
-            dict: Dictionary containing the estimated scalar values.
-        """        
-        data_size = self.pcd.size(0)
-        patch_dataloader = self.patch_loader(self.data)
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            A dictionary where keys are the quantity names and values are the
+            estimated tensors.
+        """
+
+        surface = self.surface_patch()
+
         output = {}
-        
-        for batch in patch_dataloader:
-            mask = batch.cluster_mask.flatten()
-            indices = batch.ind[mask]
-            
-            patch = self.surface_patch(batch)
-            
-            for name in scalar_names:
-                quantity = getattr(patch, name, None)
-                if quantity is None:
-                    raise ValueError(f'Unknown scalar name: {name}')
-                if name not in output:
-                    output[name] = torch.zeros((data_size, *quantity.shape[1:]), 
-                                               device=self.device)
-                output[name][indices] = quantity[mask]
-        
+        for name in quantity_names:
+            if hasattr(surface, name):
+                output[name] = getattr(surface, name)
+
         return output
-    
-    
-    def flow_step(self, 
-                  delta_t: float, 
-                  subsample_radius: float, 
-                  smooth_radius: float, 
-                  smooth_x: bool) -> dict:
+
+    def flow_step(
+        self,
+        delta_t: float,
+        subsample_radius: float,
+        smooth_radius: float,
+        smooth_x: bool,
+    ) -> dict:
         """
         Perform a single step of mean curvature flow on the point cloud.
 
-        Args:
-            delta_t (float): Time step for the flow.
-            subsample_radius (float): Radius used for subsampling points.
-            smooth_radius (float): Radius used for smoothing mean curvature.
-            smooth_x (bool): Whether to smooth the point cloud before flow.
+        Parameters
+        ----------
+        delta_t : float
+            Time step for the flow.
+        subsample_radius : float
+            Radius used for subsampling points after the flow step.
+        smooth_radius : float
+            Radius used for smoothing the mean curvature before the flow step.
+        smooth_x : bool
+            Whether to smooth the point cloud coordinates before the flow step.
 
-        Returns:
-            dict: Dictionary containing the update point cloud data, normals, 
+        Returns
+        -------
+        dict
+            A dictionary containing the updated point cloud data ('x'), normals,
             and mean curvature.
-        """        
-        
+        """
+
         if smooth_x:
-            estimate = self.estimate_quantities(['xyz_coordinates'])
-            x = estimate['xyz_coordinates']
+            estimate = self.estimate_quantities(["xyz_coordinates"])
+            x = estimate["xyz_coordinates"]
             self.pcd = x
-            self.data['x'] = x
-        
-        estimate = self.estimate_quantities(['normals', 'mean_curvature'])
+            self.data["x"] = x
+
+        estimate = self.estimate_quantities(["normals", "mean_curvature"])
         x = self.pcd
-        normals = estimate['normals']
-        mean_curvature = smooth_values_by_gaussian(x=x,
-                                                   values=estimate['mean_curvature'],
-                                                   radius=smooth_radius)
+        normals = estimate["normals"]
+        mean_curvature = smooth_values_by_gaussian(
+            x=x, values=estimate["mean_curvature"], radius=smooth_radius
+        )
         new_x = x + delta_t * mean_curvature.view(-1, 1) * normals
         subsampled_indices = subsample_points_by_radius(new_x, subsample_radius)
         new_x = new_x[subsampled_indices]
         new_normals = normals[subsampled_indices]
         mean_curvature = mean_curvature[subsampled_indices]
 
-        new_data = {'x': new_x, 
-                    'normals': new_normals, 
-                    'mean_curvature': mean_curvature}
-        
+        new_data = {
+            "x": new_x.contiguous(),
+            "normals": new_normals.contiguous(),
+            "mean_curvature": mean_curvature.contiguous(),
+        }
+
         return new_data
 
-        
-    def mean_flow(self,
-                  num_steps: int,
-                  save_data_per_step: int,
-                  delta_t: float,
-                  subsample_radius: float,
-                  smooth_radius: float,
-                  smooth_x: bool) -> list[dict]:
+    def mean_flow(
+        self,
+        num_steps: int,
+        save_data_per_step: int,
+        delta_t: float,
+        subsample_radius: float,
+        smooth_radius: float,
+        smooth_x: bool,
+    ) -> list[dict]:
         """
-        Perform mean curvature flow on the point cloud.
+        Perform mean curvature flow on the point cloud over multiple steps.
 
-        Args:
-            num_steps (int): Number of steps to perform.
-            save_data_per_step (int): Save data every n steps.
-            delta_t (float): Time step for the flow.
-            subsample_radius (float): Radius used for subsampling points. 
-            smooth_radius (float): Radius used for smoothing mean curvature.
-            smooth_x (bool): Whether to smooth the point cloud before flow.
+        This method iteratively applies the mean curvature flow step and saves
+        the state of the point cloud at specified intervals.
 
-        Returns:
-            list[dict]: List of dictionaries containing the updated point cloud data
-            and normals at each saved time step.
-        """        
-        
+        Parameters
+        ----------
+        num_steps : int
+            The total number of flow steps to perform.
+        save_data_per_step : int
+            The interval at which to save the point cloud data. For example, a
+            value of 5 means data is saved every 5 steps.
+        delta_t : float
+            Time step for each flow step.
+        subsample_radius : float
+            Radius used for subsampling points after each flow step.
+        smooth_radius : float
+            Radius used for smoothing the mean curvature before each flow step.
+        smooth_x : bool
+            Whether to smooth the point cloud coordinates before each flow step.
+
+        Returns
+        -------
+        list[dict]
+            A list of dictionaries. Each dictionary contains the point cloud
+            data ('x'), 'normals', and 'mean_curvature' at a saved step.
+        """
+
         save_data = []
         for i in tqdm(range(num_steps)):
-            new_data = self.flow_step(delta_t=delta_t,
-                                      subsample_radius=subsample_radius,
-                                      smooth_radius=smooth_radius,
-                                      smooth_x=smooth_x)
+            new_data = self.flow_step(
+                delta_t=delta_t,
+                subsample_radius=subsample_radius,
+                smooth_radius=smooth_radius,
+                smooth_x=smooth_x,
+            )
             self.data = new_data.copy()
-            self.pcd = new_data['x']
-            self.orientation = new_data['normals']
+            self.pcd = new_data["x"]
+            self.orientation = new_data["normals"]
+            if not torch.isfinite(new_data["x"]).all():
+                print(f"Nan or Infinite detected in Mean Flow! Exiting early at iteration {i}")
+                return save_data
+
             if i % save_data_per_step == 0:
                 save_data.append(new_data.copy())
-        
+
         return save_data
-    
-    def gmls_weights(self, batch: Batch, 
-                     radius: float=1., 
-                     p: int=4) -> list[torch.Tensor]:
+
+    def gmls_weights(
+        self, patch_data: PatchData, mask: torch.Tensor, radius: float = 1.0, p: int = 4
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the weights for the generalized moving least squares (GMLS) method.
 
-        Args:
-            batch (Batch): Batch containing the input data.
-            radius (float, optional): Radius to truncate weight function. Defaults to 1..
-            p (int, optional): Degree p of the weight function. Defaults to 4.
+        Parameters
+        ----------
+        patch_data : PatchData
+            PatchData object containing coordinate data.
+        mask : torch.Tensor
+            A boolean mask indicating which points in the patch data to use.
+        radius : float, optional
+            Radius to truncate the weight function, by default 1.0.
+        p : int, optional
+            The exponent for the weight function, by default 4.
 
-        Returns:
-            list[torch.Tensor]: List of weight matrices for each batch.
-        """     
-        xs = [
-            batch[i].x[batch[i].mask.flatten(), :2] for i in range(batch.num_graphs)
-            ]
-        centers = batch.x[batch.cluster_mask.flatten(), :2]
-        cxs = [x - centers[i].view(1, 2) for i, x in enumerate(xs)]
-        Ws = [
-            torch.diag(
-                F.relu(1 - cxs[j].norm(dim=1) / radius).pow(p))
-            for j in range(batch.num_graphs)
-            ]
-        return Ws
-    
-    def laplace_beltrami_legendre_blocks(self, 
-                                         surface: SurfacePatch
-                                         ) -> list[torch.Tensor]:
-        """Laplace-Beltrami operator of Legendre basis functions at each center point.
-
-        Args:
-            surface (SurfacePatch): Surface patch object.
-
-        Returns:
-            list[torch.Tensor]: List of outputs at each center point.
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            A tuple containing:
+            - The weight matrices for each patch (batch_size, 1, num_points).
+            - The dense mask used to create the dense batch.
         """
-        
-        lb_values = surface.laplace_beltrami_legendre_basis[surface.cluster_mask]
-        return torch.split(lb_values, split_size_or_sections=1, dim=0)
-    
-    def legendre_blocks(self, surface: SurfacePatch) -> list[torch.Tensor]:
-        """Legendre basis functions blocked by batch.
+        uv = patch_data.local_coordinates[mask, :2]
+        dists = uv.norm(dim=1)
+        dists_dense, mask = tg.utils.to_dense_batch(
+            x=dists, batch=patch_data.patch_number[mask], fill_value=torch.inf
+        )
+        weights = F.relu(1 - dists_dense / radius).pow(p)
 
-        Args:
-            surface (SurfacePatch): Surface patch object.
+        return weights.unsqueeze(1), mask
 
-        Returns:
-            list[torch.Tensor]: List of outputs per batch.
+    def laplace_beltrami_legendre_blocks(self, surface: Surface) -> torch.Tensor:
         """
-        mask = surface.mask
-        batch = surface.batch[mask]
-        
-        legendre_values = surface.basis.evaluate(surface.x[mask, :2])
-        legendre_blocks = [
-            legendre_values[batch == i] for i in range(batch.max() + 1)
-            ]
+        Compute the Laplace-Beltrami operator of Legendre basis functions.
+
+        Parameters
+        ----------
+        surface : Surface
+            Surface object containing patch information and basis functions.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor containing the Laplace-Beltrami operator applied
+        """
+
+        return surface.laplace_beltrami_basis_terms
+
+    def legendre_blocks(self, surface: Surface, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate Legendre basis functions for each point in the patches.
+
+        This method evaluates the Legendre basis functions at the local `uv`
+        coordinates of the points specified by the mask and returns them as a
+        dense tensor, batched by patch.
+
+        Parameters
+        ----------
+        surface : Surface
+            Surface object containing patch data and basis functions.
+        mask : torch.Tensor
+            A boolean mask to select which points' local coordinates to use for
+            the evaluation.
+
+        Returns
+        -------
+        torch.Tensor
+            A dense tensor of Legendre basis function evaluations, with shape
+            (num_patches, max_points_in_patch, num_basis_functions).
+        """
+        uv = surface.patch.local_coordinates[mask, :2]
+        legendre_values = surface.basis.evaluate(uv)
+        legendre_blocks, _ = tg.utils.to_dense_batch(
+            x=legendre_values, batch=surface.patch.patch_number[mask], fill_value=0
+        )
+
         return legendre_blocks
-    
-    def stiffness_on_batch(self, 
-                           batch: Batch, 
-                           radius: float=1., 
-                           p: int=4) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute the stiffness matrix on a batch of data.
 
-        Args:
-            batch (Batch): Batch containing the input data.
-            radius (float, optional): Radius to truncate weight function. Defaults to 1..
-            p (int, optional): Degree p of the weight function. Defaults to 4.
-
-        Returns:
-            torch.Tensor: Indices and values of the stiffness matrix.
-        """        
-        Ws = self.gmls_weights(batch, radius=radius, p=p)
-        surface = self.surface_patch(batch)
-        legendre_blocks = self.legendre_blocks(surface)
-        lb_blocks = self.laplace_beltrami_legendre_blocks(surface)
-        
-        outputs = [
-            torch.linalg.lstsq((leg.T @ W @ leg).cpu(), (leg.T @ W).cpu(), driver='gelsd')
-            for leg, W in zip(legendre_blocks, Ws)
-        ]
-        stiffness_values = torch.cat([
-            -lb @ output.solution.to(self.device) 
-            for lb, output in zip(lb_blocks, outputs)
-            ], dim=1).flatten()
-        
-        row_inds = batch.ind[surface.cluster_mask]
-        column_inds = [
-            batch[i].ind[batch[i].mask].view(1, -1) for i in range(batch.num_graphs)
-            ]
-        stiffness_indices = torch.cat([
-            torch.cat(
-                (row_inds[i] * torch.ones((1, column_inds[i].shape[1]), device=self.device), 
-                 column_inds[i]), dim=0) 
-            for i in range(batch.num_graphs)], dim=1
-            )
-        return stiffness_indices, stiffness_values
-    
-    
-    def stiffness_matrix_gmls(self, 
-                              drop_ratio: float=0.1,
-                              radius: float=1., 
-                              p: int=4,
-                              remove_outliers: bool=False) -> sp.coo_matrix:
+    def stiffness_matrix_gmls(
+        self,
+        drop_ratio: float = 0.1,
+        radius: float = 1.0,
+        p: int = 4,
+        remove_outliers: bool = False,
+        outlier_threshold: float = 0.2,
+    ) -> tuple[sp.csr_array, torch.Tensor, torch.Tensor]:
         """
         Compute the stiffness matrix using the generalized moving least squares (GMLS) method.
 
-        Args:
-            drop_ratio (float, optional): Ratio of points to drop. Defaults to 0.1.
-            radius (float, optional): Radius to truncate weight function. Defaults to 1..
-            p (int, optional): Degree p of the weight function. Defaults to 4.
-            remove_outliers (bool, optional): Whether to remove outliers. Defaults to False.
+        Parameters
+        ----------
+            drop_ratio: float, optional
+                Ratio of points to drop. Defaults to 0.1.
+            radius: float, optional
+                Radius to truncate weight function. Defaults to 1..
+            p: int, optional
+                Degree p of the weight function. Defaults to 4.
+            remove_outliers: bool, optional
+                Whether to remove outliers. Defaults to False.
+            outlier_threshold: float, optional
+                The threshold used to determine which points are labeled as outliers.
+                Only used if remove_outliers is True.
 
-        Returns:
-            sp.coo_matrix: Stiffness matrix.
+        Returns
+        -------
+            sp.csr_array
+                Stiffness matrix for solving the Laplace-Beltrami PDE
+            torch.Tensor
+                Mask for which values to solve collocation problem on.
+            torch.Tensor
+                Mask for points that are removed in smoothing. If remove_outliers is False
+                then the mask will be all true.
         """
-        
+
         if remove_outliers:
-            outputs = self.estimate_quantities(['x', 'pca_coordinates'])
-            outlier_mask = (outputs['x' - outputs['pca_coordinates']].norm(dim=1) < 0.1)
+            outputs = self.estimate_quantities(["local_coordinates", "pca_coordinates"])
+            outlier_mask = (
+                outputs["local_coordinates"] - outputs["pca_coordinates"]
+            ).norm(dim=1) < outlier_threshold
             for k, v in self.data.items():
                 self.data[k] = v[outlier_mask]
             self.pcd = self.pcd[outlier_mask]
             self.orientation = self.orientation[outlier_mask]
-        
-        drop_inds = fps(self.pcd, ratio=drop_ratio)
-        self.data['stiffness_mask'] = torch.ones(self.pcd.size(0), 
-                                                 dtype=torch.bool,
-                                                 device=self.device)
-        self.data['stiffness_mask'][drop_inds] = False
-        
-        self.patch_loader.center = 'gmls'
-        patch_dataloader = self.patch_loader(self.data)
-        stiffness_indices = []
-        stiffness_values = []
-        
-        for batch in tqdm(patch_dataloader):
-            batch.mask = batch.mask & batch.stiffness_mask
-            indices, values = self.stiffness_on_batch(batch, radius=radius, p=p)
-            stiffness_indices.append(indices)
-            stiffness_values.append(values)
-        
-        stiffness_indices = torch.cat(stiffness_indices, dim=1)
-        stiffness_values = torch.cat(stiffness_values)
-        
-        notmask = torch.logical_not(self.data['stiffness_mask'])
-        skipped = torch.arange(self.data['stiffness_mask'].shape[0], 
-                               device=self.device)[notmask]
-        if len(skipped) > 0:
-            subtract_index_value = torch.zeros_like(stiffness_indices[1], 
-                                                    device=self.device)
-            num_iters = skipped.shape[0] / 10
-            num_iters = int(num_iters) if num_iters % 1 == 0 else int(num_iters) + 1
-            for i in range(num_iters):
-                start = i * 10
-                end = min((i+1) * 10, skipped.shape[0])
-                subtract_index_value += (
-                    stiffness_indices[1].view(-1, 1) > skipped[start:end].view(1, -1)
-                    ).sum(dim=1)
-            stiffness_indices[1] = stiffness_indices[1] - subtract_index_value.long()
-        
-        stiffness = sp.coo_matrix((
-            stiffness_values.cpu().numpy(), 
-            stiffness_indices.cpu().numpy().astype(np.int32)
-        ))
-        return stiffness
+        else:
+            outlier_mask = torch.ones(
+                self.pcd.shape[0], dtype=torch.bool, device=self.pcd.device
+            )
+        if drop_ratio > 0.0:
+            drop_inds = tg.nn.fps(self.pcd, ratio=drop_ratio).to(self.device)
+        else:
+            drop_inds = torch.LongTensor([])
+        collocation_mask = torch.ones(
+            self.pcd.shape[0], dtype=torch.bool, device=self.device
+        )
+        collocation_mask[drop_inds] = False
+
+        patch_data = self.patch_data(mode="gmls")
+        coord_mask = collocation_mask[patch_data.patch_indices]
+        surface = self.surface_patch(patch_data)
+        weights, tensor_mask = self.gmls_weights(patch_data, coord_mask, radius, p)
+        legendre = self.legendre_blocks(surface, coord_mask)
+        lb = self.laplace_beltrami_legendre_blocks(surface)
+
+        ls_solutions = torch.linalg.lstsq(
+            (legendre.permute(0, 2, 1) * weights) @ legendre,
+            legendre.permute(0, 2, 1) * weights,
+        ).solution
+
+        stiffness_values = (-lb.unsqueeze(1) @ ls_solutions).squeeze(1)[tensor_mask]
+
+        _, patch_indices_reindexed = torch.unique(
+            patch_data.patch_indices[coord_mask], return_inverse=True
+        )
+        stiffness_indices = torch.stack(
+            [
+                patch_data.patch_number.flatten()[coord_mask],
+                patch_indices_reindexed,
+            ],
+            dim=0,
+        )
+        stiffness = sp.coo_matrix(
+            (
+                stiffness_values.cpu().numpy(),
+                stiffness_indices.cpu().numpy().astype(np.int32),
+            )
+        ).tocsr()
+        return stiffness, collocation_mask, outlier_mask
