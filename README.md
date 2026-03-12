@@ -30,11 +30,13 @@ point-clouds have artifacts, such as outliers as shown below.
 <img src="https://github.com/atzberg/geo_neural_op/blob/main/images/docs/point_cloud_outliers.png" width="60%"> 
 </p>
 
-**Examples:** We provide practical demonstrations for how GNPs can be used in practice.  This includes examples (i) to estimate geometric properties, such as the metric and curvatures of
-surfaces, (ii) to approximate solutions of geometric partial differential
-equations (PDEs) on manifolds, and (iii) to perform curvature-driven flows of
-shapes. These results show a few ways GNPs can be used for incorporating the
-roles of geometry into machine learning processing pipelines and solvers.
+**Examples:** We provide practical demonstrations for how GNPs can be used in
+practice.  This includes examples (i) to estimate geometric properties, such as
+the metric and curvatures of surfaces, (ii) to approximate solutions of
+geometric partial differential equations (PDEs) on manifolds, and (iii) to
+perform curvature-driven flows of shapes. These results show a few ways GNPs
+can be used for incorporating the roles of geometry into machine learning
+processing pipelines and solvers.
 
 __Quick Start__
 
@@ -50,6 +52,52 @@ You may also need to first install `pip`,
 conda install pip 
 ```
 
+Install PyTorch prior to installing the repo to avoid installation errors 
+related to torch-cluster and torch-scatter. To install PyTorch with cpu, use:
+```bash
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+```
+To install with CUDA, use one of the following, replacing X with the correct version:
+```bash
+# CUDA 11.X
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu11X
+# CUDA 12.X
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu12X 
+```
+For available CUDA versions, see 
+[PyTorch Previous Versions](https://pytorch.org/get-started/previous-versions/).
+Once PyTorch is installed, you can install this repository using pip:
+```bash
+cd geo_neural_op
+pip install .
+```
+If you want to run the example notebooks, you can install the additional dependencies using:
+```bash
+pip install .[dev]
+```
+If there is an error installing because of torch-cluster or torch-scatter, adding
+the flag `--no-build-isolation` should fix this. Building wheels for torch-cluster and torch-scatter can be quite time consuming.
+
+Alternatively, you can 
+install torch-cluster and torch-scatter separately using the pre-built wheels 
+corresponding to your PyTorch installation. After they are installed, you can proceed with 
+installing this repository. Installing using the pre-built wheels can be done using the appropriate command below:
+```bash
+# CPU Build
+pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.6.0+cpu.html
+# CUDA 11.X
+pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.6.0+cu121X.html
+# CUDA 12.X 
+pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.6.0+cu12X.html 
+```
+
+__Testing__
+
+You can run tests for the package using
+
+```bash
+python -m unittest discover tests
+```
 For use of the package see the [examples folder](https://github.com/atzberg/geo_neural_op/tree/main/examples).  
 More information on the structure of the package also can be found on the
 [documentation pages](https://web.math.ucsb.edu/~atzberg/geo_neural_op_docs/html/index.html).
@@ -69,6 +117,28 @@ For information on how to use the package, see
 - [Examples](./examples) 
 
 - [Documentation](https://web.math.ucsb.edu/~atzberg/geo_neural_op_docs/html/index.html) 
+
+
+__Version 2.0 Efficiency Gains__
+
+``geo_neural_op`` v2.0.0 sees significant speed gains by leveraging the
+optimized data processing of ``PatchTensor`` and inference of the ``PatchGNP``
+using the new separable, block-factorized kernels. Below, we display a
+comparison of average running times for versions 1.0.0 and 2.0.0 on both CPU
+and CUDA devices. Each task is run 10 times on each of the example data found
+in ``geo_neural_op/example_data``. We display the average times to perform each
+task on one data sample from ``example_data``. In all cases, v2.0 sees about >18x
+speed up on CPU and about a >7x speed up on CUDA devices. 
+
+
+| Task | v1.0.0 CPU | v1.0.0 CUDA | v2.0.0 CPU | v2.0.0 CUDA|
+|---------------------|------------|-------------|------------|------------|
+| Geometric Quantities| 139.39s | 22.27s | 7.55s | 2.86s |
+| Stiffness Matrix Construction | 2,591.73s | 524.32s | 117.85s | 7.85s |
+| Mean Flow (10 steps) | 1,484.20s | 242.42s | 81.61s | 28.10s |
+
+
+
 
 __Additional Information__
 
