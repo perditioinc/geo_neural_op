@@ -121,15 +121,14 @@ For information on how to use the package, see
 
 __Version 2.0 Efficiency Gains__
 
-``geo_neural_op`` v2.0.0 sees significant speed gains by leveraging the
-optimized data processing of ``PatchTensor`` and inference of the ``PatchGNP``
-using the new separable, block-factorized kernels. Below, we display a
-comparison of average running times for versions 1.0.0 and 2.0.0 on both CPU
-and CUDA devices. Each task is run 10 times on each of the example data found
+``geo_neural_op`` v2.0.0 sees significant efficiency gains by leveraging the
+optimized data processing of ``PatchTensor`` and inference of the ``PatchGNP``.
+This uses the new separable, block-factorized kernels (see papers). Below, we display a
+comparison of the average running times for versions 1.0.0 and 2.0.0 on both CPU
+and CUDA devices. Each task is run 10 times on each of the example data sets found
 in ``geo_neural_op/example_data``. We display the average times to perform each
 task on one data sample from ``example_data``. In all cases, v2.0 sees about >18x
 speed up on CPU and about a >7x speed up on CUDA devices. 
-
 
 | Task | v1.0.0 CPU | v1.0.0 CUDA | v2.0.0 CPU | v2.0.0 CUDA|
 |---------------------|------------|-------------|------------|------------|
